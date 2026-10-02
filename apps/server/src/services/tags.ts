@@ -2,6 +2,42 @@ import { getDb, newId, nowIso } from '../db.js';
 import { errors } from '../http/errors.js';
 import { slugify } from './inspirations.js';
 
+/**
+ * 校验父标签合法性：必须存在、同库、同域。
+ * 重挂（传入 movingTagId）时额外沿祖先链检测环——不允许挂到自身或其子孙下，
+ * 否则标签树会出现跨库悬空引用或成环（成环的节点会从树中整体消失）。
+ */
+function assertValidParent(params: {
+  libraryId: string;
+  domain: string;
+  parentId: string;
+  movingTagId?: string;
+}): void {
+  const db = getDb();
+  const parent = db
+    .prepare('SELECT id, library_id, domain FROM tag WHERE id = ?')
+    .get(params.parentId) as { id: string; library_id: string; domain: string } | undefined;
+  if (!parent) throw errors.notFound('父标签');
+  if (parent.library_id !== params.libraryId) throw errors.scopeDenied();
+  if (parent.domain !== params.domain) throw errors.badRequest('父标签必须属于同一标签域');
+
+  if (params.movingTagId) {
+    // 沿新父级的祖先链向上走，遇到自身即成环；visited 同时防御既有脏数据导致的死循环
+    const visited = new Set<string>([params.movingTagId]);
+    let cursor: string | null = params.parentId;
+    while (cursor) {
+      if (visited.has(cursor)) {
+        throw errors.badRequest('不能把标签挂到自身或其子孙下（会形成环）');
+      }
+      visited.add(cursor);
+      const row = db.prepare('SELECT parent_id FROM tag WHERE id = ?').get(cursor) as
+        | { parent_id: string | null }
+        | undefined;
+      cursor = row?.parent_id ?? null;
+    }
+  }
+}
+
 export function createTag(params: {
   libraryId: string;
   domain: string;
@@ -16,12 +52,7 @@ export function createTag(params: {
   if (existing) throw errors.badRequest('同域下已存在同名标签', { tagId: existing.id });
 
   if (params.parentId) {
-    const parent = db.prepare('SELECT domain, library_id FROM tag WHERE id = ?').get(params.parentId) as
-      | { domain: string; library_id: string }
-      | undefined;
-    if (!parent) throw errors.notFound('父标签');
-    if (parent.library_id !== params.libraryId) throw errors.scopeDenied();
-    if (parent.domain !== params.domain) throw errors.badRequest('父标签必须属于同一标签域');
+    assertValidParent({ libraryId: params.libraryId, domain: params.domain, parentId: params.parentId });
   }
 
   const maxOrder = (
@@ -62,8 +93,16 @@ export function updateTag(
   if (!row) throw errors.notFound('标签');
   if (row.library_id !== libraryId) throw errors.scopeDenied();
 
+  // 先完成全部校验再写入，避免部分字段已更新而整体报错
+  if (patch.name !== undefined && row.is_builtin) {
+    throw errors.forbiddenRole('内置标签不可改名，可停用或新增自定义标签');
+  }
+  if (patch.parentId) {
+    // 重挂校验：拒绝跨库、跨域与环（含挂到自身/子孙）；parentId 为 null 表示移到顶层，无需校验
+    assertValidParent({ libraryId, domain: row.domain, parentId: patch.parentId, movingTagId: id });
+  }
+
   if (patch.name !== undefined) {
-    if (row.is_builtin) throw errors.forbiddenRole('内置标签不可改名，可停用或新增自定义标签');
     db.prepare('UPDATE tag SET name = ?, slug = ?, updated_at = ? WHERE id = ?').run(
       patch.name,
       slugify(patch.name),

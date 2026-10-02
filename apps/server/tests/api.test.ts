@@ -447,3 +447,106 @@ describe('E10 备份与质量门', () => {
     expect(Object.values(res.body.dirs).every((v) => v === 'ok')).toBe(true);
   });
 });
+
+describe('E11 标签重挂守卫（拒绝跨库与环，保持同库层级完整）', () => {
+  let tagA = '';
+  let tagB = '';
+  let tagC = '';
+  let tagScene = '';
+
+  interface TagNode {
+    id: string;
+    name: string;
+    parentId: string | null;
+    children?: TagNode[];
+  }
+  function findInTree(nodes: TagNode[], id: string): TagNode | null {
+    for (const n of nodes) {
+      if (n.id === id) return n;
+      const hit = n.children ? findInTree(n.children, id) : null;
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  it('准备：创建 A→B→C 三级自定义标签与一个异 domain 标签', async () => {
+    const a = await call('post', '/api/tags', { domain: 'light', name: '重挂测试甲' });
+    expect(a.status).toBe(201);
+    tagA = a.body.id;
+    const b = await call('post', '/api/tags', { domain: 'light', name: '重挂测试乙', parentId: tagA });
+    expect(b.status).toBe(201);
+    tagB = b.body.id;
+    const c = await call('post', '/api/tags', { domain: 'light', name: '重挂测试丙', parentId: tagB });
+    expect(c.status).toBe(201);
+    tagC = c.body.id;
+    const s = await call('post', '/api/tags', { domain: 'scene', name: '重挂测试异域' });
+    expect(s.status).toBe(201);
+    tagScene = s.body.id;
+  });
+
+  it('拒绝挂到自身（400）', async () => {
+    const res = await call('patch', `/api/tags/${tagA}`, { parentId: tagA });
+    expect(res.status).toBe(400);
+  });
+
+  it('拒绝挂到子孙（直接子级与隔代都成环，400）', async () => {
+    const direct = await call('patch', `/api/tags/${tagA}`, { parentId: tagB });
+    expect(direct.status).toBe(400);
+    const grand = await call('patch', `/api/tags/${tagA}`, { parentId: tagC });
+    expect(grand.status).toBe(400);
+  });
+
+  it('拒绝跨域重挂（400）', async () => {
+    const res = await call('patch', `/api/tags/${tagA}`, { parentId: tagScene });
+    expect(res.status).toBe(400);
+  });
+
+  it('拒绝不存在的父标签（404）', async () => {
+    const res = await call('patch', `/api/tags/${tagA}`, { parentId: 'tag-not-exist' });
+    expect(res.status).toBe(404);
+  });
+
+  it('拒绝跨库重挂（403 LIBRARY_SCOPE_DENIED）', async () => {
+    const ownerToken = token;
+    const reg = await call('post', '/api/auth/register', {
+      email: 'second@test.local',
+      password: 'password123',
+      displayName: '第二个人',
+    });
+    expect(reg.status).toBe(201);
+    token = reg.body.token;
+    const other = await call('post', '/api/tags', { domain: 'light', name: '另一个库的标签' });
+    expect(other.status).toBe(201);
+    token = ownerToken;
+
+    const res = await call('patch', `/api/tags/${tagA}`, { parentId: other.body.id });
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('LIBRARY_SCOPE_DENIED');
+  });
+
+  it('校验失败时不产生部分写入（同请求里的改名不生效）', async () => {
+    const res = await call('patch', `/api/tags/${tagB}`, { name: '不应生效的名字', parentId: tagC });
+    expect(res.status).toBe(400);
+    const tree = await call('get', '/api/tags');
+    expect(findInTree(tree.body.items, tagB)?.name).toBe('重挂测试乙');
+  });
+
+  it('合法重挂成功且树结构正确；parentId 为 null 可移到顶层', async () => {
+    // C 从 B 下移到 A 下（同库同域、无环）
+    const res = await call('patch', `/api/tags/${tagC}`, { parentId: tagA });
+    expect(res.status).toBe(200);
+    let tree = await call('get', '/api/tags');
+    const a = findInTree(tree.body.items, tagA);
+    expect((a?.children ?? []).some((t) => t.id === tagC)).toBe(true);
+    const b = findInTree(tree.body.items, tagB);
+    expect((b?.children ?? []).some((t) => t.id === tagC)).toBe(false);
+
+    // 移到顶层
+    const toRoot = await call('patch', `/api/tags/${tagC}`, { parentId: null });
+    expect(toRoot.status).toBe(200);
+    tree = await call('get', '/api/tags');
+    const cAsRoot = (tree.body.items as TagNode[]).find((t) => t.id === tagC);
+    expect(cAsRoot).toBeTruthy();
+    expect(cAsRoot?.parentId).toBeNull();
+  });
+});

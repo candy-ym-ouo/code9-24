@@ -2,6 +2,45 @@ import { getDb, newId, nowIso } from '../db.js';
 import { errors } from '../http/errors.js';
 import { slugify } from './inspirations.js';
 
+/**
+ * 断言一次"重挂父标签"合法：父标签必须存在、同库、同域，且不能是标签自身或其后代
+ * （否则 parent_id 会指向别的库或形成环，标签树会断裂）。
+ * createTag 传 tagId=null；updateTag / mergeTags 传被移动标签的 id。
+ */
+function assertValidParent(params: {
+  libraryId: string;
+  domain: string;
+  parentId: string | null;
+  tagId: string | null;
+}): void {
+  const parentId = params.parentId;
+  if (!parentId) return;
+  const db = getDb();
+  const parent = db.prepare('SELECT id, domain, library_id FROM tag WHERE id = ?').get(parentId) as
+    | { id: string; domain: string; library_id: string }
+    | undefined;
+  if (!parent) throw errors.notFound('父标签');
+  if (parent.library_id !== params.libraryId) throw errors.scopeDenied();
+  if (parent.domain !== params.domain) throw errors.badRequest('父标签必须属于同一标签域');
+  if (params.tagId && (parentId === params.tagId || isInSubtree(parentId, params.tagId))) {
+    throw errors.badRequest('不能把标签挂到自身或自己的子标签下（会形成环）');
+  }
+}
+
+/** maybeDescendantId 是否位于 rootId 的子树内（沿 parent_id 链向上追溯能否到达 rootId） */
+function isInSubtree(maybeDescendantId: string, rootId: string): boolean {
+  const db = getDb();
+  let current: string | null = maybeDescendantId;
+  for (let depth = 0; current && depth < 10000; depth += 1) {
+    if (current === rootId) return true;
+    const row = db.prepare('SELECT parent_id FROM tag WHERE id = ?').get(current) as
+      | { parent_id: string | null }
+      | undefined;
+    current = row?.parent_id ?? null;
+  }
+  return false;
+}
+
 export function createTag(params: {
   libraryId: string;
   domain: string;
@@ -15,14 +54,12 @@ export function createTag(params: {
     .get(params.libraryId, params.domain, slug) as { id: string } | undefined;
   if (existing) throw errors.badRequest('同域下已存在同名标签', { tagId: existing.id });
 
-  if (params.parentId) {
-    const parent = db.prepare('SELECT domain, library_id FROM tag WHERE id = ?').get(params.parentId) as
-      | { domain: string; library_id: string }
-      | undefined;
-    if (!parent) throw errors.notFound('父标签');
-    if (parent.library_id !== params.libraryId) throw errors.scopeDenied();
-    if (parent.domain !== params.domain) throw errors.badRequest('父标签必须属于同一标签域');
-  }
+  assertValidParent({
+    libraryId: params.libraryId,
+    domain: params.domain,
+    parentId: params.parentId ?? null,
+    tagId: null,
+  });
 
   const maxOrder = (
     db
@@ -61,29 +98,36 @@ export function updateTag(
     | undefined;
   if (!row) throw errors.notFound('标签');
   if (row.library_id !== libraryId) throw errors.scopeDenied();
-
-  if (patch.name !== undefined) {
-    if (row.is_builtin) throw errors.forbiddenRole('内置标签不可改名，可停用或新增自定义标签');
-    db.prepare('UPDATE tag SET name = ?, slug = ?, updated_at = ? WHERE id = ?').run(
-      patch.name,
-      slugify(patch.name),
-      nowIso(),
-      id,
-    );
+  if (patch.name !== undefined && row.is_builtin) {
+    throw errors.forbiddenRole('内置标签不可改名，可停用或新增自定义标签');
   }
+  // 先做全部校验，再在单个事务里落库，避免改到一半失败留下半截状态
   if (patch.parentId !== undefined) {
-    db.prepare('UPDATE tag SET parent_id = ?, updated_at = ? WHERE id = ?').run(patch.parentId, nowIso(), id);
+    assertValidParent({ libraryId, domain: row.domain, parentId: patch.parentId, tagId: id });
   }
-  if (patch.sortOrder !== undefined) {
-    db.prepare('UPDATE tag SET sort_order = ?, updated_at = ? WHERE id = ?').run(patch.sortOrder, nowIso(), id);
-  }
-  if (patch.disabled !== undefined) {
-    db.prepare('UPDATE tag SET disabled = ?, updated_at = ? WHERE id = ?').run(
-      patch.disabled ? 1 : 0,
-      nowIso(),
-      id,
-    );
-  }
+
+  const ts = nowIso();
+  const apply = db.transaction(() => {
+    if (patch.name !== undefined) {
+      db.prepare('UPDATE tag SET name = ?, slug = ?, updated_at = ? WHERE id = ?').run(
+        patch.name,
+        slugify(patch.name),
+        ts,
+        id,
+      );
+    }
+    if (patch.parentId !== undefined) {
+      // 重挂必须拒绝跨库 / 跨域 / 自身或后代成环，否则标签树会断裂
+      db.prepare('UPDATE tag SET parent_id = ?, updated_at = ? WHERE id = ?').run(patch.parentId, ts, id);
+    }
+    if (patch.sortOrder !== undefined) {
+      db.prepare('UPDATE tag SET sort_order = ?, updated_at = ? WHERE id = ?').run(patch.sortOrder, ts, id);
+    }
+    if (patch.disabled !== undefined) {
+      db.prepare('UPDATE tag SET disabled = ?, updated_at = ? WHERE id = ?').run(patch.disabled ? 1 : 0, ts, id);
+    }
+  });
+  apply();
 }
 
 /** 合并标签：绑定关系迁移 + 去重 + usage_count 重算（文档 11.2） */
@@ -99,6 +143,10 @@ export function mergeTags(sourceId: string, targetId: string, libraryId: string)
   if (src.library_id !== libraryId || tgt.library_id !== libraryId) throw errors.scopeDenied();
   if (src.domain !== tgt.domain) throw errors.badRequest('只能合并同一标签域内的标签');
   if (sourceId === targetId) throw errors.badRequest('源标签与目标标签不能相同');
+  // 源标签是目标标签的祖先时合并会把目标挂到自己的子孙下成环，必须拒绝
+  if (isInSubtree(targetId, sourceId)) {
+    throw errors.badRequest('不能将标签合并到它自己的子标签下（会形成环）');
+  }
 
   const run = db.transaction(() => {
     const bindings = db
@@ -110,6 +158,13 @@ export function mergeTags(sourceId: string, targetId: string, libraryId: string)
          ON CONFLICT (inspiration_id, tag_id) DO NOTHING`,
       ).run(b.inspiration_id, targetId, nowIso());
     }
+    // 删除源标签前先把它的子标签挂到源标签的原父级（同库同域，层级不丢；
+    // 根标签的子标签则升为根），避免 ON DELETE SET NULL 之外出现语义上的层级断裂
+    db.prepare('UPDATE tag SET parent_id = (SELECT parent_id FROM tag WHERE id = ?), updated_at = ? WHERE parent_id = ?').run(
+      sourceId,
+      nowIso(),
+      sourceId,
+    );
     db.prepare('DELETE FROM tag WHERE id = ?').run(sourceId);
     const n = (
       db.prepare('SELECT COUNT(*) AS n FROM inspiration_tag WHERE tag_id = ?').get(targetId) as { n: number }

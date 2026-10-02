@@ -18,6 +18,7 @@ import type {
 import { TAG_DOMAINS } from '@flil/shared';
 import { getDb, parseJson, rowToBool } from '../db.js';
 import { config } from '../config.js';
+import { logger } from '../logger.js';
 import { fuzzSpotCached, type PlaceRow, type SpotRow } from './fuzzing.js';
 import { loadTiming, timingRowToDto, windowSummary } from './windowEngine.js';
 import type { AssetRow } from './assets.js';
@@ -104,6 +105,15 @@ export function buildTagTree(rows: Record<string, unknown>[]): TagDto[] {
       parent.children = parent.children ?? [];
       parent.children.push(tag);
     } else {
+      if (tag.parentId) {
+        // 正常情况下写路径（createTag/updateTag/mergeTags）已拒绝跨库父级，
+        // 走到这里只可能是历史脏数据；按根挂载保证可见，并在日志中留下痕迹
+        logger.warn('tag 引用了不在当前库结果集中的父标签，已按根标签挂载', {
+          tagId: tag.id,
+          parentId: tag.parentId,
+        });
+        tag.parentId = null;
+      }
       roots.push(tag);
     }
   }

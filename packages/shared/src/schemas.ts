@@ -61,12 +61,12 @@ export const updateInspirationSchema = z.object({
 export const createTagSchema = z.object({
   domain: zEnum(TagDomain),
   name: z.string().min(1).max(60),
-  parentId: z.string().nullable().optional(),
+  parentId: z.string().min(1).nullable().optional(),
 });
 
 export const updateTagSchema = z.object({
   name: z.string().min(1).max(60).optional(),
-  parentId: z.string().nullable().optional(),
+  parentId: z.string().min(1).nullable().optional(),
   sortOrder: z.number().int().optional(),
   disabled: z.boolean().optional(),
 });
